@@ -1,0 +1,266 @@
+clear;
+clear global;
+
+% grid approximation related variables
+global stateBoundsInterp Hupper Hlower Plower  NPT gridH gridW gridY
+global Supper Slower Hupper_census VFsubindex SSGridMov SSGridStay numberGridPoints
+% stochastic process for shocks
+global process 
+% parameters of utility function, probability of survival etc.
+global gamma rho beta delta delta_short psi tc Rf Rf_short YGR PRM DPR LPVBASE gro expec_gro T xi xi_short
+% price and service flow coefficients
+global p_prices p_services 
+% survey data and approximation points for functions
+global survey_comp approx_points census_grid NH
+% points where equilibrium is enforced and supply cdf
+global quant_points supp_cdf_inv
+% program control
+global print_flag debug_flag normfact inffact vf_short
+
+%============================================================
+% set control flags and function specifications
+%============================================================
+stata_dir = '.\data\';
+empmatlab_dir = '.\data\';
+
+% load experiment definitions
+exper_def_20221104;
+
+% experiment to run
+exper_type = 'testsearch';
+
+this_exper=experlist.(exper_type);
+
+disp(' ');
+disp('------------------------------------');
+disp('Experiment description:');
+disp(this_exper);
+
+% run_mode: 'search' for equm search or 'results' for just one excess-demand computation
+run_mode='search';
+
+% price vs. service flow computation: fct_mode='service' or
+% fct_mode='price'
+fct_mode=this_exper.fct_mode;
+
+% exogenous vs. endogenous expectations: exp_mode='endog' or exp_mode='exog'
+exp_mode=this_exper.exp_mode;
+
+% only movers vs. all HH: samp_mode='movers' or samp_mode='all'
+samp_mode=this_exper.samp_mode;
+
+% set experiment-dependent parameters
+% down payment share and interest rates
+delta=this_exper.delta;
+delta_short=this_exper.delta_short;
+Rf=this_exper.Rf;
+Rf_short=this_exper.Rf_short;
+xi=this_exper.xi;
+xi_short=this_exper.xi_short;
+% std.dev. of idiosyncratic house price shock
+std_p_idio=this_exper.std_p_idio;
+
+% specify guess for function to be computed;
+% needs to be combination of N bins and N-1 values for service flow,
+% or N bins and N values for price,
+serv_points=this_exper.serv_points;
+serv_search_guess=this_exper.serv_search_guess;
+price_search_points=this_exper.price_search_points;
+price_search_guess=this_exper.price_search_guess;
+
+% specify the service flow function in case fct_mode=='price' 
+serv_vals=this_exper.serv_vals;
+% specify long-run price function for case of exp_mode=='exog'
+LR_price_points=this_exper.LR_price_points;
+LR_price_vals=this_exper.LR_price_vals;
+
+% if long run value function has already been computed, can load it here
+load_LR_valfct='LR_valfct_out.mat';
+%load_LR_valfct=[];
+
+% year of the survey
+demand_survey_index=this_exper.demand_survey_index; % 1->2000, 4->2005, 8-> 2000 with 2005 wealth
+supply_survey_index=this_exper.supply_survey_index;
+
+% set points at which to match cdf (as quantile on [0,1])
+quant_points=this_exper.quant_points;
+num_hbins=length(quant_points);
+
+% output control
+print_flag=1; debug_flag=0;
+
+% parallel processes? set this to one for just one process to suppress
+% parallization
+no_par_processes=16;
+
+             
+%===============================================================
+%===============================================================
+
+
+cp=gcp('nocreate');
+if (~isempty(cp)) && (cp.NumWorkers~=no_par_processes)
+   delete(cp);
+   if no_par_processes>0
+      parpool(no_par_processes);
+   end
+elseif (isempty(cp)) && (no_par_processes>0)
+   parpool(no_par_processes);
+end
+
+
+% set all exogenous parameters
+set_parameters;
+% set inflation factor based on year
+if strcmp(exper_type,'service')
+    inffact=inffact2000;
+else
+    inffact=1;
+end
+
+% prepare the survey data and grid bounds
+load_surveys;
+
+
+% make date string
+curr_date=clock;
+date_str='';
+for i=1:5
+   date_str=[date_str,'_',num2str(curr_date(i))]; 
+end
+%diary(['log',date_str,'.txt']);
+
+% for case of exogenous expectations, precompute the long-run VF
+p_prices_expec=[];
+LR_val_coef=[];
+if strcmp(exp_mode,'exog')
+    if ~isempty(load_LR_valfct)
+        load(load_LR_valfct,'LR_val_coef');
+        disp(['Loading LR value functions from ',load_LR_valfct,'.']);
+        disp(' ');
+    else
+        if strcmp(fct_mode,'service')
+            approx_points=[Hlower,LR_price_points,Hupper];
+            p_prices=pchip(approx_points,[Plower,exp(LR_price_vals+gro)]);
+            approx_points=[Hlower,serv_points,Hupper];       
+            fct_vals=serv_search_guess;
+        else
+            approx_points=[Hlower,serv_points,Hupper];
+            p_services=pchip(approx_points,[Slower,serv_vals]);
+            approx_points=[Hlower,LR_price_points,Hupper];
+            fct_vals=LR_price_vals+gro;
+        end
+        % prepare current survey
+        prep_current_survey;
+        % compute excess demand for long run
+        [~,~,~,~,~,LR_val_coef,~]=calc_ex_dem_interp(fct_vals,fct_mode,[],[],0);
+        save('LR_valfct_out','LR_val_coef');
+    end
+end
+
+% prepare survey data for main computation
+prep_current_survey;
+
+% prepare price and service flow functions for computation
+if strcmp(fct_mode,'service')   
+    
+    approx_points=[Hlower,LR_price_points,Hupper];
+    p_prices=pchip(approx_points,[Plower,exp(LR_price_vals)]);
+    
+    approx_points=[Hlower,serv_points,Hupper];
+    search_guess=serv_search_guess;
+    
+    nsbins=length(serv_points)+1;
+    lowerBnd=ones(1,nsbins)*log(Slower);
+    upperBnd=ones(1,nsbins)*Inf;
+    
+    A=zeros(nsbins);
+
+    A(1,:)=[-1,zeros(1,nsbins-1)];
+    for i=2:nsbins
+        A(i,:)=[zeros(1,i-2),1,-1,zeros(1,nsbins-i)];
+    end
+
+    RHS=zeros(1,nsbins);
+    RHS(1)=-log(Slower);
+    
+elseif strcmp(fct_mode,'price')
+
+    approx_points=[Hlower,serv_points,Hupper];
+    p_services=pchip(approx_points,[Slower,serv_vals]);
+    % expected prices for exog. expectations
+    if strcmp(exp_mode,'exog')
+        approx_points=[Hlower,LR_price_points,Hupper];    
+        p_prices_expec=pchip(approx_points,[Plower,exp(LR_price_vals)]);
+    end
+    
+    approx_points=[Hlower,price_search_points,Hupper];
+    search_guess=price_search_guess;
+    
+    nsbins=length(price_search_points);
+    lowerBnd=zeros(1,nsbins+1);
+    upperBnd=ones(1,nsbins+1)*800;
+    
+    A=zeros(nsbins+1);
+
+    A(1,:)=[-1,zeros(1,nsbins)];
+    for i=2:nsbins+1
+        A(i,:)=[zeros(1,i-2),1,-1,zeros(1,nsbins+1-i)];
+    end
+    
+    RHS=zeros(1,nsbins+1);
+    RHS(1)=-log(Slower);
+   
+else
+    disp('Unknown function mode!'); 
+end
+
+
+if strcmp(run_mode,'search')
+    
+    
+    write_configuration;
+    
+    optionsps=psoptimset('Display','iter','Cache','on','ScaleMesh','off','CompletePoll','on','InitialMeshSize',0.025,'MaxMeshSize',0.2);
+    
+%     if ~isempty(sp_set)
+%         guess=search_guess(sp_set);
+%         A=A(sp_set,sp_set);
+%         RHS=RHS(sp_set);
+%         lowerBnd=ones(length(sp_set),1)*search_guess(min(sp_set));
+%         upperBnd=ones(length(sp_set),1)*Inf;        
+%     else
+    guess=search_guess;        
+%    end
+    calc_ex_dem_handle=@(x)calc_ex_dem_interp(x,fct_mode,LR_val_coef,p_prices_expec,0);
+    seq=patternsearch(calc_ex_dem_handle,guess,A,RHS,[],[],...
+                      lowerBnd,upperBnd,[],optionsps);
+                  
+    save(['search_result',date_str,'.mat'],'seq');              
+    
+    
+else
+    diary(['log',date_str,'.txt']);
+
+    [~,pol,housexp,sav,...
+        polmat_out,valfct]=calc_ex_dem_interp(search_guess,fct_mode,LR_val_coef,p_prices_expec,1);
+
+    experlist.(exper_type).rundate=date_str;
+    experlist.(exper_type).polsample=[pol,housexp,sav];
+    experlist.(exper_type).polfct=polmat_out;
+    experlist.(exper_type).valfct=valfct;
+
+    save exper_list_out.mat experlist;
+
+    diary off;
+
+end
+
+
+
+
+
+
+
+
+
